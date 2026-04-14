@@ -9,6 +9,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,7 +53,20 @@ def make_driver():
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.page_load_strategy = "normal"
-    return webdriver.Chrome(options=opts)
+    
+    # --- GitHub Actions Fix ---
+    # Selenium default chrome dhundta hai, par humne chromium-browser install kiya hai
+    opts.binary_location = "/usr/bin/chromium-browser"
+    
+    # Path explicitly set kar rahe hain compatibility ke liye
+    service = Service("/usr/bin/chromedriver")
+    
+    try:
+        return webdriver.Chrome(service=service, options=opts)
+    except Exception as e:
+        logger.error(f"Failed to start Chrome: {e}")
+        # Fallback to default if service fails
+        return webdriver.Chrome(options=opts)
 
 
 def safe_print(msg):
@@ -228,13 +242,6 @@ def run_scraper(domains, output_file, failed_file):
 def scrape_domains(domains: list, run_dir: str) -> dict:
     """
     Main entry point called by orchestrator.
-    Returns: {
-        "output_file": str,
-        "final_failed_file": str,
-        "persistent_failed_file": str,  # 3-strike failures
-        "ok_count": int,
-        "err_count": int
-    }
     """
     global ok_count, err_count
     ok_count = err_count = 0
