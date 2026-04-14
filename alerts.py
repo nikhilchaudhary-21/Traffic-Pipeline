@@ -108,6 +108,14 @@ def send_alerts(processed_rows: list[dict]):
                                curr_visits, curr_slab, latest_month)
             hike_count += 1
 
+    # Heartbeat logic: Agar koi high growth alert nahi mila
+    if high_growth_count == 0:
+        status_text = (
+            "🔍 *Monitoring Status*\n"
+            "System check complete: No high-growth companies detected in this run. ✅"
+        )
+        _post_slack({"text": status_text})
+
     logger.info(f"Alerts sent: {high_growth_count} high-growth, {hike_count} 30%-hike.")
     return high_growth_count, hike_count
 
