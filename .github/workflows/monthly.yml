@@ -1,0 +1,69 @@
+name: Monthly Traffic Pipeline
+
+on:
+  schedule:
+    # 1st of every month, 6:00 AM IST (00:30 UTC)
+    - cron: "30 0 1 * *"
+  workflow_dispatch:  # Manual trigger bhi possible
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 3 hours max
+
+    steps:
+      # ── Setup ──────────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome + ChromeDriver
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            google-chrome-stable \
+            chromium-chromedriver \
+            fonts-liberation \
+            libasound2 \
+            libatk-bridge2.0-0 \
+            libdrm2 \
+            libgbm1 \
+            libnss3 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            xdg-utils
+          google-chrome --version
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Run Pipeline ───────────────────────────────────────────────────────
+      - name: Run Traffic Pipeline
+        env:
+          SF_USERNAME:        ${{ secrets.SF_USERNAME }}
+          SF_PASSWORD:        ${{ secrets.SF_PASSWORD }}
+          SF_SECURITY_TOKEN:  ${{ secrets.SF_SECURITY_TOKEN }}
+          SF_DOMAIN:          ${{ secrets.SF_DOMAIN }}         # 'login' or 'test'
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          REPORT_EMAIL:       ${{ secrets.REPORT_EMAIL }}
+        run: python main.py
+
+      # ── Upload run artifacts ────────────────────────────────────────────────
+      - name: Upload run outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-run-${{ github.run_number }}
+          path: |
+            runs/
+            pipeline.log
+          retention-days: 30
