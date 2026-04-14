@@ -28,7 +28,7 @@ jobs:
             google-chrome-stable \
             chromium-chromedriver \
             fonts-liberation \
-            libasound2 \
+            libasound2t64 \
             libatk-bridge2.0-0 \
             libdrm2 \
             libgbm1 \
