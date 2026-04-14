@@ -28,11 +28,12 @@ def pull_target_accounts(sf: Salesforce) -> list[dict]:
     Tier 1-4, Shopify = Yes, Subscription = Yes OR Maybe.
     Returns list of dicts: {Id, Name, Website, Current_Traffic__c, Traffic__c}
     """
+    # Fix: Added hyphens and spaces to match Salesforce Picklist labels exactly
     query = """
         SELECT Id, Name, Website,
                Current_Traffic__c, Last_Month_s_traffic__c, Traffic__c
         FROM Account
-        WHERE Tiering__c IN ('Tier 1','Tier 2','Tier 3','Tier 4')
+        WHERE Tiering__c IN ('Tier - 1','Tier - 2','Tier - 3','Tier - 4')
           AND Shopify__c = 'Yes'
           AND Is_It_On_Subscription__c IN ('Yes','Maybe')
           AND Website != null
@@ -81,7 +82,7 @@ def bulk_update_accounts(sf: Salesforce, updates: list[dict]):
     """
     if not updates:
         logger.info("No SF updates to push.")
-        return
+        return 0, 0
 
     records = []
     for u in updates:
