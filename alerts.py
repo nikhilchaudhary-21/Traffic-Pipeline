@@ -1,6 +1,6 @@
 """
 alerts.py
-Slack pe high-growth aur 30%-hike alerts bhejo.
+Slack pe high-growth individual aur 30%-hike ka summary report bhejo.
 """
 
 import os
@@ -8,6 +8,7 @@ import json
 import logging
 import urllib.request
 import urllib.error
+import time
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -55,34 +56,38 @@ def send_high_growth_alert(domain: str, company_name: str,
         f"New Visits: `{current_visits:,}`"
     )
     _post_slack({"text": text})
+    time.sleep(1)  # Rate limit protection
 
 
-def send_hike_30_alert(domain: str, company_name: str,
-                        change_pct: float, current_visits: int,
-                        current_slab: str, latest_month: str):
+def send_summary_report(total_count, ok_count, fail_count, sf_count, high_growth_count, hike_count):
     """
-    30%+ MoM growth alert (already in 10k+ bracket, under 200k).
+    Ek single message mein poori report card.
     """
-    month_label = _format_month(latest_month)
+    now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
     text = (
-        f"📈 *30%+ Traffic Hike!*\n"
-        f"Company: `{domain}`\n"
-        f"Name: *{company_name}*\n"
-        f"MoM Change: `+{change_pct:.2f}%`\n"
-        f"Current Traffic: `{current_visits:,}` ({current_slab}) — {month_label}"
+        f"📊 *Monthly Traffic Report Summary*\n"
+        f"Generated: {now_str}\n\n"
+        f"Total Accounts: `{total_count}`\n"
+        f"Scraped OK: `{ok_count}`\n"
+        f"Failed (3x): `{fail_count}`\n"
+        f"SF Updated: `{sf_count}`\n\n"
+        f"High Growth 🚀: `{high_growth_count}`\n"
+        f"30%+ Hike 📈: `{hike_count}`\n\n"
+        f"_Detailed 30% hike list and CSV sent via Email._"
     )
     _post_slack({"text": text})
 
 
-def send_alerts(processed_rows: list[dict]):
+def send_alerts(processed_rows: list[dict], total_scraped: int, total_failed: int, total_sf_ok: int):
     """
     processed_rows: output of calculations.process_all()
     Sends alerts for:
-      1. High growth (2+ slab jumps)
-      2. 30% hike for accounts already in 10k-200k range
+      1. High growth (2+ slab jumps) - Individual
+      2. 30% hike - Summary only to avoid Slack 429
     """
     high_growth_count = 0
     hike_count = 0
+    total_accounts = len(processed_rows) + total_failed
 
     for row in processed_rows:
         domain        = row["domain"]
@@ -99,24 +104,32 @@ def send_alerts(processed_rows: list[dict]):
                                    curr_visits, latest_month)
             high_growth_count += 1
 
-        # 2. 30% hike: already in 10k–200k, no slab jump needed
+        # 2. 30% hike: Count only for the report summary
         elif (change_pct > 30
               and curr_visits >= 10_000
               and curr_visits < 200_000
               and not row["is_high_growth"]):
-            send_hike_30_alert(domain, company, change_pct,
-                               curr_visits, curr_slab, latest_month)
             hike_count += 1
 
-    # Heartbeat logic: Agar koi high growth alert nahi mila
-    if high_growth_count == 0:
+    # Send the final aggregated summary report
+    send_summary_report(
+        total_accounts, 
+        total_scraped, 
+        total_failed, 
+        total_sf_ok, 
+        high_growth_count, 
+        hike_count
+    )
+
+    # Heartbeat logic: Agar kuch bhi interesting nahi mila
+    if high_growth_count == 0 and hike_count == 0:
         status_text = (
             "🔍 *Monitoring Status*\n"
-            "System check complete: No high-growth companies detected in this run. ✅"
+            "System check complete: No significant growth detected. ✅"
         )
         _post_slack({"text": status_text})
 
-    logger.info(f"Alerts sent: {high_growth_count} high-growth, {hike_count} 30%-hike.")
+    logger.info(f"Alerts processed: {high_growth_count} high-growth, {hike_count} summary hikes.")
     return high_growth_count, hike_count
 
 

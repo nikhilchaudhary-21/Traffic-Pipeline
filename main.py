@@ -60,7 +60,7 @@ def main():
 
     # ── 2. Scrape ─────────────────────────────────────────────────────────────
     scrape_result = scrape_domains(domains, run_dir)
-    output_file         = scrape_result["output_file"]
+    output_file          = scrape_result["output_file"]
     persistent_fail_file = scrape_result["persistent_failed_file"]
 
     # Read scraped rows
@@ -87,7 +87,13 @@ def main():
     sf_ok, sf_fail = bulk_update_accounts(sf, sf_updates)
 
     # ── 5. Slack alerts ───────────────────────────────────────────────────────
-    high_growth_count, hike_30_count = send_alerts(processed)
+    # Updated to pass counts for the new summary report logic in alerts.py
+    high_growth_count, hike_30_count = send_alerts(
+        processed_rows=processed,
+        total_scraped=scrape_result["ok_count"],
+        total_failed=len(persistent_failed_domains),
+        total_sf_ok=sf_ok
+    )
 
     # ── 6. Build summary ──────────────────────────────────────────────────────
     # Latest month from scrape results
