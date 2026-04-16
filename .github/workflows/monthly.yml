@@ -4,13 +4,13 @@ on:
   schedule:
     # 1st of every month, 6:00 AM IST (00:30 UTC)
     - cron: "30 0 1 * *"
-  workflow_dispatch:  # Manual trigger bhi possible
+  workflow_dispatch:  # Manual trigger for testing
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # 3 hours max
-
+    timeout-minutes: 360  # Increased to 6 hours for 5-pass logic
+    
     steps:
       # ── Setup ──────────────────────────────────────────────────────────────
       - name: Checkout code
@@ -21,11 +21,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Chrome + ChromeDriver
+      - name: Install Chromium + Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            google-chrome-stable \
+            chromium-browser \
             chromium-chromedriver \
             fonts-liberation \
             libasound2t64 \
@@ -37,7 +37,7 @@ jobs:
             libxdamage1 \
             libxrandr2 \
             xdg-utils
-          google-chrome --version
+          chromium-browser --version
 
       - name: Install Python dependencies
         run: |
@@ -50,7 +50,7 @@ jobs:
           SF_USERNAME:        ${{ secrets.SF_USERNAME }}
           SF_PASSWORD:        ${{ secrets.SF_PASSWORD }}
           SF_SECURITY_TOKEN:  ${{ secrets.SF_SECURITY_TOKEN }}
-          SF_DOMAIN:          ${{ secrets.SF_DOMAIN }}         # 'login' or 'test'
+          SF_DOMAIN:          ${{ secrets.SF_DOMAIN }}
           SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
