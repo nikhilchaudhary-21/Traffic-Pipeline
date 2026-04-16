@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 NUM_WORKERS  = 10
 BATCH_SIZE   = 10
 LOAD_TIMEOUT = 45
-MAX_RETRIES  = 3  # per domain across all passes
+MAX_RETRIES  = 5  # Updated to 5 passes total
 
 FIELDNAMES = ["url", "total_visits", "visits_change", "latest_month", "scraped_at", "status"]
 
@@ -55,17 +55,13 @@ def make_driver():
     opts.page_load_strategy = "normal"
     
     # --- GitHub Actions Fix ---
-    # Selenium default chrome dhundta hai, par humne chromium-browser install kiya hai
     opts.binary_location = "/usr/bin/chromium-browser"
-    
-    # Path explicitly set kar rahe hain compatibility ke liye
     service = Service("/usr/bin/chromedriver")
     
     try:
         return webdriver.Chrome(service=service, options=opts)
     except Exception as e:
         logger.error(f"Failed to start Chrome: {e}")
-        # Fallback to default if service fails
         return webdriver.Chrome(options=opts)
 
 
@@ -77,7 +73,6 @@ def safe_print(msg):
 def parse_latest_month_from_svg(soup):
     """
     X-axis ticks from the SVG chart me latest month detect karo.
-    Format: YYYY/MM  →  returns 'YYYY-MM'
     """
     ticks = []
     for text_el in soup.select("g.recharts-cartesian-axis.xAxis text tspan"):
@@ -85,8 +80,8 @@ def parse_latest_month_from_svg(soup):
         if re.match(r"\d{4}/\d{2}", t):
             ticks.append(t)
     if ticks:
-        latest = sorted(ticks)[-1]          # e.g. "2026/03"
-        return latest.replace("/", "-")     # "2026-03"
+        latest = sorted(ticks)[-1]
+        return latest.replace("/", "-")
     return ""
 
 
@@ -118,10 +113,8 @@ def parse_card_details(card_soup, domain):
     row["scraped_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row["status"] = "ok"
 
-    # Latest month from SVG chart
     row["latest_month"] = parse_latest_month_from_svg(card_soup)
 
-    # Stat blocks
     stat_blocks = card_soup.find_all("div", class_=re.compile(r"rounded-md.*bg-muted|bg-muted.*rounded-md"))
     for block in stat_blocks:
         label_el = block.find("p", class_=re.compile("text-muted-foreground"))
@@ -132,7 +125,6 @@ def parse_card_details(card_soup, domain):
         val = value_el.get_text(strip=True)
 
         if "Total Visits" in lbl:
-            # e.g. "3.04M+13.96%"  or  "3.04M -5.2%"
             m = re.match(r"([\d\.]+[KMB]?)\s*([+-][\d\.]+%)?", val)
             if m:
                 row["total_visits"]  = m.group(1).strip() if m.group(1) else ""
@@ -156,7 +148,6 @@ def worker(worker_id, batch_queue, total_batches, output_file, failed_file):
         url = f"https://traffic.cv/bulk?domains={domains_str}"
 
         try:
-            # Browser crash recovery
             try:
                 driver.get(url)
             except Exception:
@@ -168,7 +159,6 @@ def worker(worker_id, batch_queue, total_batches, output_file, failed_file):
                 driver = make_driver()
                 driver.get(url)
 
-            # Wait for all cards to load
             start_t = time.time()
             while time.time() - start_t < LOAD_TIMEOUT:
                 current_html = driver.page_source
@@ -179,7 +169,7 @@ def worker(worker_id, batch_queue, total_batches, output_file, failed_file):
                     break
                 time.sleep(2)
 
-            time.sleep(2)  # JS chart render buffer
+            time.sleep(2)
             parsed = parse_bulk_page(driver.page_source, batch)
 
             success_rows = []
@@ -213,7 +203,6 @@ def worker(worker_id, batch_queue, total_batches, output_file, failed_file):
 
 
 def run_scraper(domains, output_file, failed_file):
-    """domains = list of domain strings"""
     if not domains:
         logger.info("No domains to scrape.")
         return
@@ -240,44 +229,64 @@ def run_scraper(domains, output_file, failed_file):
 
 
 def scrape_domains(domains: list, run_dir: str) -> dict:
-    """
-    Main entry point called by orchestrator.
-    """
     global ok_count, err_count
     ok_count = err_count = 0
 
     output_file       = os.path.join(run_dir, "scraped_output.csv")
-    failed_file       = os.path.join(run_dir, "failed_pass1.csv")
+    failed_file1      = os.path.join(run_dir, "failed_pass1.csv")
     failed_file2      = os.path.join(run_dir, "failed_pass2.csv")
+    failed_file3      = os.path.join(run_dir, "failed_pass3.csv")
+    failed_file4      = os.path.join(run_dir, "failed_pass4.csv")
     persistent_failed = os.path.join(run_dir, "persistent_failures.csv")
 
     init_file(output_file, FIELDNAMES)
-    init_file(failed_file, ["url"])
+    init_file(failed_file1, ["url"])
 
     logger.info(f"=== Pass 1: {len(domains)} domains ===")
-    run_scraper(domains, output_file, failed_file)
+    run_scraper(domains, output_file, failed_file1)
 
-    # --- Pass 2: retry failed ---
-    failed_domains = _read_domains(failed_file)
-    if failed_domains:
-        logger.info(f"=== Pass 2 (retry): {len(failed_domains)} domains ===")
+    # --- Pass 2 ---
+    failed_domains1 = _read_domains(failed_file1)
+    if failed_domains1:
+        time.sleep(60)
+        logger.info(f"=== Pass 2: {len(failed_domains1)} domains ===")
         init_file(failed_file2, ["url"])
-        run_scraper(failed_domains, output_file, failed_file2)
+        run_scraper(failed_domains1, output_file, failed_file2)
 
-        # --- Pass 3: final retry ---
+        # --- Pass 3 ---
         failed_domains2 = _read_domains(failed_file2)
         if failed_domains2:
-            logger.info(f"=== Pass 3 (final retry): {len(failed_domains2)} domains ===")
-            init_file(persistent_failed, ["url"])
-            run_scraper(failed_domains2, output_file, persistent_failed)
+            time.sleep(60)
+            logger.info(f"=== Pass 3: {len(failed_domains2)} domains ===")
+            init_file(failed_file3, ["url"])
+            run_scraper(failed_domains2, output_file, failed_file3)
+
+            # --- Pass 4 ---
+            failed_domains3 = _read_domains(failed_file3)
+            if failed_domains3:
+                time.sleep(60)
+                logger.info(f"=== Pass 4: {len(failed_domains3)} domains ===")
+                init_file(failed_file4, ["url"])
+                run_scraper(failed_domains3, output_file, failed_file4)
+
+                # --- Pass 5: Final Retry ---
+                failed_domains4 = _read_domains(failed_file4)
+                if failed_domains4:
+                    time.sleep(60)
+                    logger.info(f"=== Pass 5 (Final): {len(failed_domains4)} domains ===")
+                    init_file(persistent_failed, ["url"])
+                    run_scraper(failed_domains4, output_file, persistent_failed)
+                else:
+                    init_file(persistent_failed, ["url"])
+            else:
+                init_file(persistent_failed, ["url"])
         else:
             init_file(persistent_failed, ["url"])
     else:
-        init_file(failed_file2, ["url"])
         init_file(persistent_failed, ["url"])
 
     final_persistent = _read_domains(persistent_failed)
-    logger.info(f"=== Scraping complete: {ok_count} ok, {len(final_persistent)} persistent failures ===")
+    logger.info(f"=== Scraping complete: {ok_count} ok, {len(final_persistent)} failures ===")
 
     return {
         "output_file": output_file,
@@ -296,4 +305,4 @@ def _read_domains(csv_path) -> list:
             u = row.get("url", "").strip()
             if u:
                 domains.append(u)
-    return domains
+    return list(set(domains))

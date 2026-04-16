@@ -4,8 +4,10 @@ Gmail SMTP se full analysis report email karo.
 """
 
 import os
+import csv
 import smtplib
 import logging
+import tempfile
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -16,7 +18,11 @@ logger = logging.getLogger(__name__)
 
 GMAIL_USER     = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")  # Gmail App Password (not account password)
-REPORT_TO      = os.environ.get("REPORT_EMAIL", GMAIL_USER)
+
+# --- MULTIPLE RECIPIENTS LOGIC ---
+# REPORT_EMAIL variable se comma-separated list pick karega
+raw_emails = os.environ.get("REPORT_EMAIL", GMAIL_USER)
+REPORT_TO_LIST = [e.strip() for e in raw_emails.split(",") if e.strip()]
 
 
 def _slab_bar(count: int, total: int, width: int = 20) -> str:
@@ -82,7 +88,7 @@ def build_html_report(run_summary: dict) -> str:
         pf_items = "".join(f"<li style='color:#DC2626;font-size:13px'>{d}</li>" for d in pf_domains[:50])
         pf_html = f"""
         <h3 style="margin:24px 0 8px;color:#DC2626;font-size:15px">
-            ⚠️ Persistent Failures ({len(pf_domains)} domains — 3 attempts failed)
+            ⚠️ Persistent Failures ({len(pf_domains)} domains — 5 attempts failed)
         </h3>
         <p style="font-size:13px;color:#6B7280;margin:0 0 8px">
             These domains are highlighted for manual review.
@@ -96,7 +102,6 @@ def build_html_report(run_summary: dict) -> str:
 <div style="max-width:680px;margin:32px auto;background:#fff;border-radius:12px;
             box-shadow:0 1px 3px rgba(0,0,0,.1);overflow:hidden">
 
-  <!-- Header -->
   <div style="background:linear-gradient(135deg,#1E40AF,#3B82F6);padding:28px 32px">
     <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700">
       📊 Monthly Traffic Report
@@ -104,7 +109,6 @@ def build_html_report(run_summary: dict) -> str:
     <p style="margin:4px 0 0;color:#BFDBFE;font-size:14px">{month} &nbsp;·&nbsp; Generated {now}</p>
   </div>
 
-  <!-- KPI Strip -->
   <div style="display:flex;background:#F0F9FF;border-bottom:1px solid #E0F2FE">
     {"".join([
         f'<div style="flex:1;padding:16px;text-align:center;border-right:1px solid #E0F2FE">'
@@ -114,7 +118,7 @@ def build_html_report(run_summary: dict) -> str:
         for val, label, color in [
             (total,   "Total Accounts",    "#111827"),
             (ok,      "Scraped OK",        "#059669"),
-            (fail,    "Failed (3x)",       "#DC2626"),
+            (fail,    "Failed (5x)",       "#DC2626"),
             (sf_ok,   "SF Updated",        "#2563EB"),
             (hg,      "High Growth 🚀",    "#7C3AED"),
             (h30,     "30%+ Hike 📈",      "#D97706"),
@@ -124,7 +128,6 @@ def build_html_report(run_summary: dict) -> str:
 
   <div style="padding:24px 32px">
 
-    <!-- Slab Distribution -->
     <h3 style="margin:0 0 12px;color:#111827;font-size:15px">Traffic Slab Distribution</h3>
     <table style="width:100%;border-collapse:collapse;background:#F9FAFB;border-radius:8px;overflow:hidden">
       <thead>
@@ -137,7 +140,6 @@ def build_html_report(run_summary: dict) -> str:
       <tbody>{slab_rows}</tbody>
     </table>
 
-    <!-- High Growth -->
     <h3 style="margin:24px 0 12px;color:#111827;font-size:15px">🚀 High Growth Accounts (2+ Slab Jump)</h3>
     <table style="width:100%;border-collapse:collapse;background:#F9FAFB;border-radius:8px;overflow:hidden">
       <thead>
@@ -152,7 +154,6 @@ def build_html_report(run_summary: dict) -> str:
       <tbody>{hg_rows}</tbody>
     </table>
 
-    <!-- Run Stats -->
     <h3 style="margin:24px 0 8px;color:#111827;font-size:15px">Run Statistics</h3>
     <table style="width:100%;border-collapse:collapse">
       <tr>
@@ -168,15 +169,10 @@ def build_html_report(run_summary: dict) -> str:
         <td style="padding:5px 0;text-align:right;font-weight:700;color:#D97706">{h30}</td>
       </tr>
     </table>
-
     {pf_html}
-
   </div>
-
-  <!-- Footer -->
-  <div style="padding:16px 32px;background:#F9FAFB;border-top:1px solid #E5E7EB;
-              font-size:12px;color:#9CA3AF;text-align:center">
-    Traffic Pipeline · Auto-generated · Do not reply
+  <div style="padding:16px 32px;background:#F9FAFB;border-top:1px solid #E5E7EB;font-size:12px;color:#9CA3AF;text-align:center">
+    Traffic Pipeline · Automated By Nikhil Chaudhary · Do not reply
   </div>
 </div>
 </body>
@@ -185,26 +181,77 @@ def build_html_report(run_summary: dict) -> str:
 
 
 def send_report(run_summary: dict):
-    """Send HTML email report via Gmail SMTP."""
+    """Send HTML report with categorized CSV attachment to multiple recipients."""
     if not GMAIL_USER or not GMAIL_APP_PASS:
         logger.warning("Gmail credentials not set — skipping email report.")
         return
 
     month = run_summary.get("month_label", datetime.now().strftime("%b %Y"))
     subject = f"📊 Traffic Pipeline Report — {month}"
-
     html_body = build_html_report(run_summary)
 
-    msg = MIMEMultipart("alternative")
+    msg = MIMEMultipart()
     msg["Subject"] = subject
     msg["From"]    = GMAIL_USER
-    msg["To"]      = REPORT_TO
+    
+    # Comma-separated recipients for the email header
+    msg["To"] = ", ".join(REPORT_TO_LIST)
+
     msg.attach(MIMEText(html_body, "html"))
+
+    # CSV Generation and Attachment
+    processed_rows = run_summary.get("processed_rows", [])
+    if processed_rows:
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', newline='', encoding='utf-8') as tmp:
+                writer = csv.writer(tmp)
+                
+                # --- SECTION 1: FULL DATA ---
+                writer.writerow(["SECTION 1: ALL ACCOUNTS DATA"])
+                fields = ["domain", "company_name", "previous_slab", "current_slab", "last_month_traffic", "current_traffic", "change_pct", "is_high_growth"]
+                writer.writerow(fields)
+                for row in processed_rows:
+                    writer.writerow([row.get(k, "") for k in fields])
+                
+                writer.writerow([]) # Empty row separator
+
+                # --- SECTION 2: HIGH GROWTH ONLY ---
+                writer.writerow(["SECTION 2: HIGH GROWTH ACCOUNTS (2+ SLAB JUMP)"])
+                writer.writerow(fields)
+                for row in processed_rows:
+                    if row.get("is_high_growth") is True:
+                        writer.writerow([row.get(k, "") for k in fields])
+
+                writer.writerow([])
+
+                # --- SECTION 3: 30% HIKE ONLY ---
+                writer.writerow(["SECTION 3: 30%+ HIKE ACCOUNTS"])
+                writer.writerow(fields)
+                for row in processed_rows:
+                    try:
+                        if float(row.get("change_pct", 0)) >= 30:
+                            writer.writerow([row.get(k, "") for k in fields])
+                    except: continue
+
+                tmp_path = tmp.name
+
+            with open(tmp_path, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename=Traffic_Analysis_{month.replace(' ', '_')}.csv")
+            msg.attach(part)
+            os.unlink(tmp_path)
+            logger.info("Categorized CSV report attached.")
+        except Exception as e:
+            logger.error(f"Error attaching CSV: {e}")
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASS)
-            server.sendmail(GMAIL_USER, REPORT_TO, msg.as_string())
-        logger.info(f"Email report sent to {REPORT_TO}")
+            # server.sendmail takes the list of recipients directly
+            server.sendmail(GMAIL_USER, REPORT_TO_LIST, msg.as_string())
+        logger.info(f"Email report sent successfully to {len(REPORT_TO_LIST)} recipients.")
     except Exception as e:
         logger.error(f"Email send failed: {e}")
