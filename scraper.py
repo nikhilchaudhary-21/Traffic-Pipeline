@@ -9,7 +9,6 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -54,15 +53,13 @@ def make_driver():
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.page_load_strategy = "normal"
     
-    # --- GitHub Actions Fix ---
-    opts.binary_location = "/usr/bin/chromium-browser"
-    service = Service("/usr/bin/chromedriver")
-    
+    opts.binary_location = "/usr/bin/google-chrome"
+
     try:
-        return webdriver.Chrome(service=service, options=opts)
+        return webdriver.Chrome(options=opts)
     except Exception as e:
         logger.error(f"Failed to start Chrome: {e}")
-        return webdriver.Chrome(options=opts)
+        raise
 
 
 def safe_print(msg):
