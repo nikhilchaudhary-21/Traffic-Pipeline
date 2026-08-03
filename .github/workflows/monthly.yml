@@ -21,16 +21,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Google Chrome
-        run: |
-          sudo install -d -m 0755 /etc/apt/keyrings
-          sudo wget -qO /etc/apt/keyrings/google-chrome.asc https://dl.google.com/linux/linux_signing_key.pub
-          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.asc] https://dl.google.com/linux/chrome/deb/ stable main" \
-            | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq google-chrome-stable
-          google-chrome --version
-
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
@@ -39,6 +29,8 @@ jobs:
       # ── Run Pipeline ───────────────────────────────────────────────────────
       - name: Run Traffic Pipeline
         env:
+          SOURCE_BASE_URL:    ${{ secrets.SOURCE_BASE_URL }}
+          SOURCE_SECRET:      ${{ secrets.SOURCE_SECRET }}
           SF_USERNAME:        ${{ secrets.SF_USERNAME }}
           SF_PASSWORD:        ${{ secrets.SF_PASSWORD }}
           SF_SECURITY_TOKEN:  ${{ secrets.SF_SECURITY_TOKEN }}

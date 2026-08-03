@@ -1,4 +1,2 @@
-selenium==4.21.0
-beautifulsoup4==4.12.3
+requests==2.32.3
 simple-salesforce==1.12.5
-lxml==5.2.1

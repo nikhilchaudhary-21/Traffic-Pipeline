@@ -4,7 +4,7 @@ Traffic Pipeline Orchestrator.
 
 Flow:
   1. SF se target accounts pull karo
-  2. Scrape traffic.cv (3 passes, max 3 retries per domain)
+  2. Fetch traffic data from the provider API (multi-pass retry per domain)
   3. Calculations karo (Excel formulas)
   4. SF me update karo
   5. Slack alerts bhejo

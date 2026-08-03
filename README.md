@@ -9,7 +9,7 @@ An automated monthly pipeline that scrapes website traffic data, syncs it to Sal
 ```
 traffic-pipeline/
 ├── main.py              # Orchestrator — core logic & flow
-├── scraper.py           # traffic.cv bulk scraper (multi-pass retry logic)
+├── scraper.py           # provider-API bulk fetcher (multi-pass retry logic)
 ├── sf_sync.py           # Salesforce integration (pull & bulk update)
 ├── calculations.py      # Traffic metrics & slab classification
 ├── alerts.py            # Slack notifications (individual & summary)

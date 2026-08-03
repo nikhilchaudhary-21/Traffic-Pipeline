@@ -1,33 +1,195 @@
+"""
+scraper.py — fetches traffic data for a list of domains via the provider API.
+
+Same public interface and CSV output as before (scrape_domains -> {url,
+total_visits, visits_change, latest_month, scraped_at, status}), with the same
+multi-pass retry logic. No browser needed.
+
+All connection details (base URL and access key) come from environment
+variables (SOURCE_BASE_URL, SOURCE_SECRET), so nothing sensitive lives in code.
+"""
+
 import csv
-import re
-import time
-import threading
-import queue
-import os
+import hashlib
+import json
 import logging
+import os
+import queue
+import secrets
+import string
+import threading
+import time
 from datetime import datetime
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from urllib.parse import urlencode
+
+import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- CONFIG ---
-NUM_WORKERS  = 10
-BATCH_SIZE   = 10
-LOAD_TIMEOUT = 45
-MAX_RETRIES  = 5  # Updated to 5 passes total
+NUM_WORKERS     = 4          # a few workers is plenty
+BATCH_SIZE      = 40         # domains per request
+REQUEST_TIMEOUT = 90
+MAX_RETRIES     = 5          # total passes
+
+# --- Connection config (from env; nothing sensitive in code) ---
+SOURCE_BASE   = os.environ.get("SOURCE_BASE_URL", "").strip()   # base URL (env)
+SOURCE_PATH   = os.environ.get("SOURCE_PATH", "/api/v1/bulk")   # API path
+SOURCE_SECRET = os.environ.get("SOURCE_SECRET", "").strip()     # access key (env)
 
 FIELDNAMES = ["url", "total_visits", "visits_change", "latest_month", "scraped_at", "status"]
 
+_NONCE_ALPHABET = string.ascii_letters + string.digits
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/event-stream",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 write_lock   = threading.Lock()
-print_lock   = threading.Lock()
 counter_lock = threading.Lock()
 ok_count = 0
 err_count = 0
 
 
+class UpstreamError(Exception):
+    """Transient/retryable failure talking to the source (network, 429, 5xx)."""
+
+
+# ── Request helpers ───────────────────────────────────────────────────────────
+def _nonce(n: int = 16) -> str:
+    return "".join(secrets.choice(_NONCE_ALPHABET) for _ in range(n))
+
+
+def _ordered_query(params: dict) -> str:
+    items = []
+    for key in sorted(params):
+        value = params[key]
+        values = value if isinstance(value, list) else [value]
+        for v in sorted(str(x) for x in values):
+            items.append((key, v))
+    return urlencode(items)
+
+
+def _auth_params(method: str, path: str, query_params: dict) -> dict:
+    ts = str(int(time.time()))
+    nonce = _nonce()
+    base = "\n".join([method.upper(), path, _ordered_query(query_params), ts, nonce])
+    token = hashlib.sha256((base + "\n" + SOURCE_SECRET).encode("utf-8")).hexdigest()
+    return {"timestamp": ts, "nonce": nonce, "signature": token}
+
+
+# ── Response parsing ──────────────────────────────────────────────────────────
+def _parse_events(text: str):
+    """Split the response body into (event, data) pairs."""
+    out = []
+    for block in text.split("\n\n"):
+        block = block.strip("\n")
+        if not block:
+            continue
+        event = "message"
+        data_lines = []
+        for line in block.split("\n"):
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        out.append((event, "\n".join(data_lines)))
+    return out
+
+
+def _monthly_sorted(monthly_visits):
+    if not monthly_visits:
+        return []
+    out = []
+    for k, v in sorted(monthly_visits.items()):
+        try:
+            out.append((str(k), int(v)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _fmt_visits(num) -> str:
+    """1_040_000 -> '1.04M', 512_000 -> '512.0K' (same style as the old scrape)."""
+    if num in (None, ""):
+        return ""
+    n = float(num)
+    if n >= 1_000_000_000:
+        return f"{round(n / 1_000_000_000, 2)}B"
+    if n >= 1_000_000:
+        return f"{round(n / 1_000_000, 2)}M"
+    if n >= 1_000:
+        return f"{round(n / 1_000, 2)}K"
+    return str(int(round(n)))
+
+
+def _fmt_change(monthly) -> str:
+    """Growth of the last two months -> '+13.96%' / '-5.20%'."""
+    if len(monthly) < 2:
+        return ""
+    cur = float(monthly[-1][1] or 0)
+    prev = float(monthly[-2][1] or 0)
+    if prev == 0:
+        return ""
+    pct = (cur - prev) / prev * 100
+    return f"{'+' if pct >= 0 else ''}{pct:.2f}%"
+
+
+# ── Fetch one batch ───────────────────────────────────────────────────────────
+def fetch_batch(domains: list, session: requests.Session) -> dict:
+    """Fetch one batch of domains. Returns {domain: row} for every domain that
+    resolved with data. Raises UpstreamError on a transient failure."""
+    params = {"stream": "true", "domain": ",".join(domains)}
+    query = {**params, **_auth_params("GET", SOURCE_PATH, params)}
+    url = f"{SOURCE_BASE}{SOURCE_PATH}?{urlencode(query)}"
+
+    try:
+        resp = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        raise UpstreamError(f"network: {type(e).__name__}")
+    if resp.status_code in (429, 403, 503) or resp.status_code >= 500:
+        raise UpstreamError(f"http {resp.status_code}")
+    if resp.status_code != 200:
+        raise UpstreamError(f"http {resp.status_code}: {resp.text[:100]}")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = {}
+    for event, data in _parse_events(resp.text):
+        if event != "traffic" or not data:
+            continue
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        domain = payload.get("domain")
+        d = payload.get("data") or {}
+        overview = d.get("overview") or {}
+        visits = overview.get("visits")
+        if not domain or visits in (None, ""):
+            continue
+        monthly = _monthly_sorted(d.get("monthlyVisits"))
+        month, year = overview.get("month"), overview.get("year")
+        if month and year:
+            latest_month = f"{year}-{int(month):02d}"
+        elif monthly:
+            latest_month = monthly[-1][0][:7]
+        else:
+            latest_month = ""
+        rows[domain] = {
+            "url": domain,
+            "total_visits": _fmt_visits(visits),
+            "visits_change": _fmt_change(monthly),
+            "latest_month": latest_month,
+            "scraped_at": now,
+            "status": "ok",
+        }
+    return rows
+
+
+# ── File helpers ──────────────────────────────────────────────────────────────
 def init_file(file_path, fields):
     if not os.path.exists(file_path):
         with open(file_path, "w", newline="", encoding="utf-8") as f:
@@ -41,140 +203,34 @@ def save_rows(file_path, rows, fields):
             writer.writerows(rows)
 
 
-def make_driver():
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--start-maximized")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.page_load_strategy = "normal"
-    
-    opts.binary_location = "/usr/bin/google-chrome"
-
-    try:
-        return webdriver.Chrome(options=opts)
-    except Exception as e:
-        logger.error(f"Failed to start Chrome: {e}")
-        raise
-
-
-def safe_print(msg):
-    with print_lock:
-        logger.info(msg)
-
-
-def parse_latest_month_from_svg(soup):
-    """
-    X-axis ticks from the SVG chart me latest month detect karo.
-    """
-    ticks = []
-    for text_el in soup.select("g.recharts-cartesian-axis.xAxis text tspan"):
-        t = text_el.get_text(strip=True)
-        if re.match(r"\d{4}/\d{2}", t):
-            ticks.append(t)
-    if ticks:
-        latest = sorted(ticks)[-1]
-        return latest.replace("/", "-")
-    return ""
-
-
-def parse_bulk_page(html, domains):
-    soup = BeautifulSoup(html, "html.parser")
-    results = {}
-
-    for h2 in soup.find_all("h2"):
-        name = h2.get_text(strip=True)
-
-        # Card ancestor dhundo
-        card = h2
-        for _ in range(8):
-            card = card.parent
-            if card and card.get("class") and any("space-y" in c for c in card.get("class", [])):
-                break
-
-        for d in domains:
-            if d.lower() in name.lower() or name.lower() in d.lower():
-                results[d] = parse_card_details(card, d)
-                break
-
-    return results
-
-
-def parse_card_details(card_soup, domain):
-    row = {f: "" for f in FIELDNAMES}
-    row["url"] = domain
-    row["scraped_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row["status"] = "ok"
-
-    row["latest_month"] = parse_latest_month_from_svg(card_soup)
-
-    stat_blocks = card_soup.find_all("div", class_=re.compile(r"rounded-md.*bg-muted|bg-muted.*rounded-md"))
-    for block in stat_blocks:
-        label_el = block.find("p", class_=re.compile("text-muted-foreground"))
-        value_el = block.find("div", class_=re.compile("font-semibold"))
-        if not label_el or not value_el:
-            continue
-        lbl = label_el.get_text(strip=True)
-        val = value_el.get_text(strip=True)
-
-        if "Total Visits" in lbl:
-            m = re.match(r"([\d\.]+[KMB]?)\s*([+-][\d\.]+%)?", val)
-            if m:
-                row["total_visits"]  = m.group(1).strip() if m.group(1) else ""
-                row["visits_change"] = m.group(2).strip() if m.group(2) else ""
-
-    return row
-
-
+# ── Worker: pull batches, sign+fetch, write rows ──────────────────────────────
 def worker(worker_id, batch_queue, total_batches, output_file, failed_file):
     global ok_count, err_count
-    driver = make_driver()
+    session = requests.Session()
 
     while True:
         try:
-            batch_data = batch_queue.get_nowait()
+            batch_idx, batch = batch_queue.get_nowait()
         except queue.Empty:
             break
 
-        batch_idx, batch = batch_data
-        domains_str = ",".join(batch)
-        url = f"https://traffic.cv/bulk?domains={domains_str}"
-
         try:
-            try:
-                driver.get(url)
-            except Exception:
-                safe_print(f"[W{worker_id}] Browser crash — restarting...")
+            rows = None
+            # A few quick retries on transient (rate-limit / network) errors.
+            for attempt in range(1, 4):
                 try:
-                    driver.quit()
-                except Exception:
-                    pass
-                driver = make_driver()
-                driver.get(url)
-
-            start_t = time.time()
-            while time.time() - start_t < LOAD_TIMEOUT:
-                current_html = driver.page_source
-                temp_soup = BeautifulSoup(current_html, "html.parser")
-                found_h2s = len(temp_soup.find_all("h2"))
-                skeletons = len(temp_soup.select("[data-slot='skeleton'], .animate-pulse"))
-                if found_h2s >= len(batch) and skeletons == 0:
+                    rows = fetch_batch(batch, session)
                     break
-                time.sleep(2)
+                except UpstreamError as e:
+                    if attempt < 3:
+                        time.sleep(min(30, 2 ** attempt))  # backoff
+                    else:
+                        logger.info(f"[W{worker_id}] batch {batch_idx} failed after retries: {e}")
 
-            time.sleep(2)
-            parsed = parse_bulk_page(driver.page_source, batch)
-
-            success_rows = []
-            failed_rows  = []
-
+            success_rows, failed_rows = [], []
             for domain in batch:
-                if domain in parsed and parsed[domain]["total_visits"]:
-                    success_rows.append(parsed[domain])
+                if rows and domain in rows and rows[domain]["total_visits"]:
+                    success_rows.append(rows[domain])
                     with counter_lock:
                         ok_count += 1
                 else:
@@ -187,16 +243,17 @@ def worker(worker_id, batch_queue, total_batches, output_file, failed_file):
             if failed_rows:
                 save_rows(failed_file, failed_rows, ["url"])
 
-            safe_print(f"(Batch {batch_idx}/{total_batches}) [W{worker_id}] "
-                       f"{len(success_rows)} ok / {len(failed_rows)} failed")
+            logger.info(f"(Batch {batch_idx}/{total_batches}) [W{worker_id}] "
+                        f"{len(success_rows)} ok / {len(failed_rows)} failed")
 
-        except Exception as e:
-            safe_print(f"[W{worker_id}] Fatal batch error: {str(e)[:80]}")
+        except Exception as e:  # never let one batch kill the worker
+            logger.info(f"[W{worker_id}] fatal batch error: {str(e)[:80]}")
             save_rows(failed_file, [{"url": d} for d in batch], ["url"])
+        finally:
+            batch_queue.task_done()
+            time.sleep(0.5)  # small politeness gap between batches
 
-        batch_queue.task_done()
-
-    driver.quit()
+    session.close()
 
 
 def run_scraper(domains, output_file, failed_file):
@@ -215,19 +272,27 @@ def run_scraper(domains, output_file, failed_file):
         t = threading.Thread(
             target=worker,
             args=(i, q, len(batches), output_file, failed_file),
-            daemon=True
+            daemon=True,
         )
         t.start()
         threads.append(t)
-        time.sleep(1.5)
+        time.sleep(0.3)
 
     for t in threads:
         t.join()
 
 
+# ── Multi-pass orchestration (unchanged logic) ────────────────────────────────
 def scrape_domains(domains: list, run_dir: str) -> dict:
     global ok_count, err_count
     ok_count = err_count = 0
+
+    if not SOURCE_SECRET or not SOURCE_BASE:
+        raise RuntimeError(
+            "SOURCE_BASE_URL and/or SOURCE_SECRET are not set. Add them as GitHub "
+            "Actions secrets (Settings → Secrets and variables → Actions) and pass "
+            "them via the workflow env."
+        )
 
     output_file       = os.path.join(run_dir, "scraped_output.csv")
     failed_file1      = os.path.join(run_dir, "failed_pass1.csv")
@@ -245,7 +310,7 @@ def scrape_domains(domains: list, run_dir: str) -> dict:
     # --- Pass 2 ---
     failed_domains1 = _read_domains(failed_file1)
     if failed_domains1:
-        time.sleep(60)
+        time.sleep(30)
         logger.info(f"=== Pass 2: {len(failed_domains1)} domains ===")
         init_file(failed_file2, ["url"])
         run_scraper(failed_domains1, output_file, failed_file2)
@@ -253,7 +318,7 @@ def scrape_domains(domains: list, run_dir: str) -> dict:
         # --- Pass 3 ---
         failed_domains2 = _read_domains(failed_file2)
         if failed_domains2:
-            time.sleep(60)
+            time.sleep(30)
             logger.info(f"=== Pass 3: {len(failed_domains2)} domains ===")
             init_file(failed_file3, ["url"])
             run_scraper(failed_domains2, output_file, failed_file3)
@@ -261,7 +326,7 @@ def scrape_domains(domains: list, run_dir: str) -> dict:
             # --- Pass 4 ---
             failed_domains3 = _read_domains(failed_file3)
             if failed_domains3:
-                time.sleep(60)
+                time.sleep(30)
                 logger.info(f"=== Pass 4: {len(failed_domains3)} domains ===")
                 init_file(failed_file4, ["url"])
                 run_scraper(failed_domains3, output_file, failed_file4)
@@ -269,7 +334,7 @@ def scrape_domains(domains: list, run_dir: str) -> dict:
                 # --- Pass 5: Final Retry ---
                 failed_domains4 = _read_domains(failed_file4)
                 if failed_domains4:
-                    time.sleep(60)
+                    time.sleep(30)
                     logger.info(f"=== Pass 5 (Final): {len(failed_domains4)} domains ===")
                     init_file(persistent_failed, ["url"])
                     run_scraper(failed_domains4, output_file, persistent_failed)
